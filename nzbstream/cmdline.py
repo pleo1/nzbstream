@@ -6,7 +6,7 @@ import signal
 import sys
 
 from nzbverify import conf
-from nzbstream import __version__, rar, nntp
+from nzbstream import __version__, rar, nntp, manager
 
 __prog__ = "nzbstream"
 
@@ -22,6 +22,8 @@ Options:
     -c<config>      : Config file to use (defaults: ~/.nzbstream, ~/.netrc)
     -n<threads>     : Number of NNTP connections to use
     -e              : Use SSL/TLS encryption
+    -q              : Skip verification stage
+    -b<bitrate>     : Maximum bitrate of file (in Bps)
     -h              : Show help text and exit
 """
 
@@ -33,16 +35,17 @@ log = logging.getLogger('nzstream')
 def print_usage():
     print __usage__ % __prog__
 
-def main(file_name, nntp_kwargs):
-    nzb_file = open(file_name)
-    nzb      = None
-    rs       = None
-    server   = None
+def main(file_name, nntp_kwargs, max_bitrate=None, do_verify=True):
+    nzb_file    = None
+    nzb         = None
+    rs          = None
+    server      = None
+    media_file  = None
+    bitrate     = None
 
     # Listen for exit
     def signal_handler(signal, frame):
-        sys.stdout.write('\n')
-        sys.stdout.write("Stopping threads...")
+        sys.stdout.write("\nStopping threads...")
         sys.stdout.flush()
         if server:
             server.quit()
@@ -52,16 +55,33 @@ def main(file_name, nntp_kwargs):
     # TODO: Listen to other signals
     signal.signal(signal.SIGINT, signal_handler)
 
-    
+    mgr = manager.Manager(file_name, nntp_kwargs, max_bitrate, do_verify)
+
+    if not mgr.initialize():
+        print "[Error] Manager failed to initialize"
+        return
+
+    if not mgr.verify():
+        print "[Error] Verification failed"
+        return
+
+    mgr.stream()
+
+    return
+
     print "Parsing NZB: %s" % file_name
     nzb = pynzb.nzb_parser.parse(nzb_file.read())
 
-    print "Looking for Rar archives"
+    print "Looking for rar archives"
     rs = rar.RarSet(nzb)
 
-    print "  Found %d Rars" % len(rs.rars)
+    print "  Found %d rars" % len(rs.rars)
 
-    print "Connectiong to server"
+    if do_verify:
+        print "Verifying all rar segments are available"
+        # TODO: Verify
+
+    print "Connecting to server"
     server = nntp.NNTP(**nntp_kwargs)
 
     print "Starting stream"
@@ -70,7 +90,6 @@ def main(file_name, nntp_kwargs):
         for segment in rarfile.segments:
             server.add_segment(segment, num_segments)
             num_segments += 1
-            #f = open('cache/%s' % seg.message_id, 'rb')
 
     log.debug("Queued %d segments" % num_segments)
     for segment in range(num_segments):
@@ -82,8 +101,23 @@ def main(file_name, nntp_kwargs):
 
             ret = rs.read(data)
             if ret:
+                if media_file is None and rs._file_name is not None:
+                    media_file = rs._file_name
+                    print "Found media file: ", media_file
+                
+                if bitrate is None:
+                    bitrate = rs._fd.get_bitrate()
+                    if bitrate:
+                        print "  Bitrate: %s" % nntp.sizeof_fmt(bitrate)
+                        if max_bitrate is not None and max_bitrate > bitrate:
+                            print "  Bitrate exceeds user-defined max (%s)"
+                            return
+
                 current_bytes, total_bytes = ret
-                sys.stdout.write("Progress: %3.2f%%, Speed: %s\r" % (float(current_bytes)/total_bytes*100, server.get_speed(True)))
+
+                # TODO: Write data to enable resuming
+
+                sys.stdout.write("\rProgress: %3.2f%%, Speed: %10s" % (float(current_bytes)/total_bytes*100, server.get_speed(True)))
                 sys.stdout.flush()
                 if current_bytes == total_bytes:
                     print "Stream completed"
@@ -95,6 +129,8 @@ def run():
         
     num_connections = DEFAULT_NUM_CONNECTIONS
     config          = None
+    max_bitrate     = None
+    do_verify       = True
     nntp_kwargs     = {
         'host':     None,
         'port':     nntplib.NNTP_PORT,
@@ -106,10 +142,19 @@ def run():
     }
     
     # Parse command line options
-    opts, args = getopt.getopt(sys.argv[1:], 's:u:P:n:c:eph', ["server=", "username=",  "port=", "connections=", "config=", "ssl", "password", "help"])
+    opts, args = getopt.getopt(sys.argv[1:], 's:u:P:n:c:b:qeph', [
+        "server=",
+        "username=", 
+        "port=",
+        "connections=",
+        "config=",
+        "ssl",
+        "password",
+        "verify",
+        "bitrate=",
+        "help"])
     for o, a in opts:
         if o in ("-h", "--help"):
-            print __help__
             print_usage()
             sys.exit(0)
         elif o in ("-s", "--server"):
@@ -134,6 +179,14 @@ def run():
                 sys.exit(0)
         elif o in ("-c", "--config"):
             config = a
+        elif o in ("-b", "--bitrate"):
+            try:
+                max_bitrate = float(a)
+            except:
+                print "Error: invalid bitrate: '%s'" % a
+                sys.exit(0)
+        elif o in ("-q", "--verify"):
+            do_verify = False
     
     # Get the NZB
     if len(args) < 1:
@@ -163,4 +216,4 @@ def run():
             nntp_kwargs['user'] = credentials[0]
             nntp_kwargs['password'] = credentials[2]
 
-    main(nzb, nntp_kwargs)
+    main(nzb, nntp_kwargs, max_bitrate, do_verify)

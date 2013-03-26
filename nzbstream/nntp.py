@@ -1,5 +1,5 @@
 from nzbverify import nntp
-from nntplib import NNTPError, NNTPPermanentError
+from nntplib import NNTPError, NNTPPermanentError, NNTPTemporaryError
 
 import logging
 import Queue
@@ -10,12 +10,14 @@ import _yenc
 
 YSPLIT_RE = re.compile(r'([a-zA-Z0-9]+)=')
 gUTF      = True
-TIME_SEP  = 5
+TIME_SEP  = 0.5
 
 log = logging.getLogger('nzbstream.nntp')
 
-def sizeof_fmt(num):
-    for x in ['bytes','KB','MB','GB','TB']:
+def sizeof_fmt(num, bytes=False):
+    if bytes:
+        num *= 8
+    for x in ['Bps','Kbps','Mbps','Gbps','Tbps']:
         if num < 1024.0:
             return "%3.1f %s" % (num, x)
         num /= 1024.0
@@ -161,17 +163,20 @@ class NNTPThread(threading.Thread):
 
                 order, message_id = self.msg_ids.get()
                 if order == -1:
-                    conn.quit()
+                    self.close_conn()
                     break
+
+                time.sleep(self.owner._delay)
 
                 start = time.time()
                 article = conn.article(message_id)
                 stop = time.time()
 
-                self.articles[order] = (decode(article[3]), start, stop)
+                article = decode(article[3])
+                self.articles[order] = (article, start, stop)
+                self.owner.add_bytes(len(article))
                 self.msg_ids.task_done()
                 log.debug("Segment %d downloaded" % order)
-                self.owner.add_bytes(len(self.articles[order][0]))
 
                 order, message_id = None, None
             except Queue.Empty:
@@ -179,16 +184,21 @@ class NNTPThread(threading.Thread):
             except NNTPPermanentError, e:
                 # Dead
                 log.error("Permanent NNTP error; quitting")
-                conn.quit()
                 log.error(e)
                 break
+            except NNTPTemporaryError, e:
+                if e.response.startswith('430'):
+                    # No such article...
+                    log.error("No such article: %s" % e)
+                    # This is a fatal error
+                    # TODO: Signal fatal error
             except Exception, e:
-                log.error(e)
+                log.error('%s: %s' %(type(e), e))
                 self.close_conn()
             finally:
                 if order and message_id:
                     # Put the message id back into the queue
-                    log.debug("Putting message back in queue")
+                    log.debug("Putting message back in queue: (%s, %s)" % (order, message_id))
                     self.msg_ids.put((order, message_id))
 
         log.debug("Thead quit")
@@ -213,20 +223,48 @@ class NNTP(object):
         self._articles  = {}
         self._lock      = threading.Lock()
 
+        self._throttle  = 0
+        self._delay     = 0
+
+        self._total_bytes = 0
+        self._start_time  = time.time()
+
         self.connect()
 
     def add_segment(self, segment, order=1):
         msgid = "<%s>" % segment.message_id
         self._msg_ids.put((order, msgid))
 
+    def set_throttle(self, bps):
+        """
+        Throttle download speed, in bits per second.
+        """
+        self._throttle = bps/8.0 # Stored as Bytes/sec
+
     def add_bytes(self, bytes):
         self._lock.acquire()
         now = time.time()
         dt  = now-self._timer
-        if dt > TIME_SEP:
-            self._speed = self._bytes/dt
-            self._bytes = 0
-            self._timer = now
+        if dt >= TIME_SEP:
+            speed   = self.get_speed()          # Speed in Bytes/sec
+            dt      = now-self._start_time
+
+            self._total_bytes += self._bytes
+            self._bytes        = 0
+            self._timer        = now
+
+            # Here is the throttling code.  It is pretty dirty, but works more or less.
+            if self._throttle > 0:
+                if speed > self._throttle:
+                    # set the delay in an attempt to throttle
+                    self._delay = self._total_bytes/self._throttle - dt
+                    if self._delay < 0:
+                        self._delay = 0
+                    self._delay /= self.threads
+                    log.debug("Setting delay to: %f" % self._delay)
+                else:
+                    self._delay = 0
+
         self._bytes += bytes
         self._lock.release()
 
@@ -246,9 +284,10 @@ class NNTP(object):
         #    return 0
         #
         #speed = self._bytes/dt
+        speed = self._total_bytes/(time.time()-self._start_time)
         if pretty:
-            return sizeof_fmt(self._speed)
-        return self._speed
+            return sizeof_fmt(speed, True)
+        return speed
         #bytes, start, stop = 0, 0, 0
         #for i in self._articles.values()[:self.threads*2]:
         #    bytes += len(i[0])
@@ -290,4 +329,3 @@ class NNTP(object):
             t.quit()
             t.join()
         self._pool = []
-
